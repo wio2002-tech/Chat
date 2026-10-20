@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>코드 채팅방</title>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
 <style>
   :root { --bg:#f3f1ec; --ink:#1d2330; --sub:#6b7280; --main:#2f5d62; --me:#2f5d62; --other:#fff; }
   * { box-sizing:border-box; }
@@ -30,6 +31,23 @@
   .m.me { align-self:flex-end; background:var(--me); color:#fff; }
   .m.me small { color:#cfe3e0; }
   button:focus-visible,input:focus-visible { outline:2px solid var(--main); outline-offset:2px; }
+  #invite { color:var(--main); font-size:14px; }
+  #invite:empty { display:none; }
+  .hdr-btns { display:flex; gap:6px; }
+  header button { padding:8px 12px; }
+  #typing { min-height:22px; font-size:13px; color:var(--sub); display:flex; align-items:center; gap:6px; padding:0 2px 6px; }
+  .dots { display:inline-flex; gap:3px; }
+  .dots i { width:5px; height:5px; border-radius:50%; background:var(--sub); animation:bounce 1.2s infinite ease-in-out; }
+  .dots i:nth-child(2) { animation-delay:.15s; }
+  .dots i:nth-child(3) { animation-delay:.3s; }
+  @keyframes bounce { 0%,60%,100% { transform:translateY(0); opacity:.4; } 30% { transform:translateY(-4px); opacity:1; } }
+  @media (prefers-reduced-motion:reduce) { .dots i { animation:none; } }
+  #qr-modal { position:fixed; inset:0; background:rgba(0,0,0,.5); display:none; align-items:center; justify-content:center; padding:16px; z-index:10; }
+  #qr-modal.on { display:flex; }
+  .qr-card { background:#fff; border-radius:16px; padding:20px; width:100%; max-width:320px; text-align:center; display:grid; gap:12px; }
+  #qr-box svg { width:100%; height:auto; display:block; }
+  #qr-link { font-size:12px; color:var(--sub); word-break:break-all; }
+  .qr-card button { flex:1; }
 </style>
 </head>
 <body>
@@ -37,6 +55,7 @@
 <section id="home" class="screen on">
   <h1>코드 채팅방</h1>
   <div class="stack">
+    <div id="invite"></div>
     <input id="nick" placeholder="닉네임" maxlength="12">
     <button id="make">방 만들기</button>
     <div class="row">
@@ -48,18 +67,28 @@
 </section>
 
 <section id="room" class="screen">
-  <header><div><b id="room-code"></b> <span>이 코드를 공유하세요</span></div><button id="leave" class="ghost">나가기</button></header>
+  <header><div><b id="room-code"></b> <span>이 코드를 공유하세요</span></div><div class="hdr-btns"><button id="qr-btn" class="ghost">QR</button><button id="leave" class="ghost">나가기</button></div></header>
   <div id="msgs"></div>
+  <div id="typing" aria-live="polite"></div>
   <form id="form" class="row">
     <input id="text" placeholder="메시지 입력" maxlength="500" autocomplete="off">
     <button>보내기</button>
   </form>
 </section>
 
+<div id="qr-modal">
+  <div class="qr-card">
+    <b>QR로 초대하기</b>
+    <div id="qr-box"></div>
+    <div id="qr-link"></div>
+    <div class="row"><button id="copy" class="ghost">링크 복사</button><button id="qr-close">닫기</button></div>
+  </div>
+</div>
+
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
   import { getDatabase, ref, set, get, push, query, orderByKey, limitToLast,
-           onChildAdded, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
+           onChildAdded, onValue, remove, onDisconnect, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyA2GqY6Uk1zqZa5xu85Av8votsECuQVJ3I",
@@ -75,6 +104,8 @@
   const db = getDatabase(initializeApp(firebaseConfig));
   const $ = id => document.getElementById(id);
   let nick = "", code = "", unsubscribe = null;
+  const cid = Math.random().toString(36).slice(2, 10);   // 이 접속의 임시 ID
+  let typingOn = false, typingTimer = null, typingUnsub = null;
 
   const show = id => { ["home","room"].forEach(s => $(s).classList.toggle("on", s === id)); };
   const err = t => { $("err").textContent = t || ""; };
@@ -102,6 +133,11 @@
     // 최근 100개를 불러오고, 이후 새 메시지는 자동으로 추가됨
     const q = query(ref(db, "messages/" + c), orderByKey(), limitToLast(100));
     unsubscribe = onChildAdded(q, snap => addMsg(snap.val()));
+    typingUnsub = onValue(ref(db, "typing/" + c), snap => {
+      const names = [];
+      snap.forEach(ch => { if (ch.key !== cid) names.push(ch.val().nickname); });
+      renderTyping(names);
+    });
   }
 
   $("make").onclick = async () => {
@@ -132,14 +168,78 @@
     const content = $("text").value.trim();
     if (!content) return;
     $("text").value = "";
+    clearTimeout(typingTimer); setTyping(false);
     try {
       await push(ref(db, "messages/" + code), { nickname: nick, content, createdAt: serverTimestamp() });
     } catch (e) { console.error(e); }
   };
 
-  $("leave").onclick = () => { if (unsubscribe) { unsubscribe(); unsubscribe = null; } show("home"); };
+  $("leave").onclick = () => {
+    clearTimeout(typingTimer); setTyping(false);
+    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+    if (typingUnsub) { typingUnsub(); typingUnsub = null; }
+    $("typing").textContent = "";
+    code = ""; show("home");
+  };
+
+  // ---- 입력 중 표시 ----
+  function setTyping(on) {
+    if (!code) return;
+    const r = ref(db, "typing/" + code + "/" + cid);
+    if (on && !typingOn) {
+      typingOn = true;
+      set(r, { nickname: nick, at: serverTimestamp() }).catch(() => {});
+      onDisconnect(r).remove().catch(() => {});   // 창을 닫으면 자동으로 사라짐
+    } else if (!on && typingOn) {
+      typingOn = false;
+      remove(r).catch(() => {});
+    }
+  }
+
+  function renderTyping(names) {
+    const box = $("typing"); box.textContent = "";
+    if (!names.length) return;
+    const label = names.length <= 2 ? names.join(", ") + "님이 입력 중" : "여러 명이 입력 중";
+    const dots = document.createElement("span");
+    dots.className = "dots"; dots.innerHTML = "<i></i><i></i><i></i>";
+    box.append(label, dots);
+  }
+
+  $("text").addEventListener("input", () => {
+    clearTimeout(typingTimer);
+    if ($("text").value.trim()) {
+      setTyping(true);
+      typingTimer = setTimeout(() => setTyping(false), 2500);
+    } else setTyping(false);
+  });
+
+  // ---- QR 초대 ----
+  $("qr-btn").onclick = () => {
+    const link = location.origin + location.pathname + "?room=" + code;
+    const qr = qrcode(0, "M"); qr.addData(link); qr.make();
+    $("qr-box").innerHTML = qr.createSvgTag({ scalable: true, margin: 2 });
+    $("qr-link").textContent = link;
+    $("copy").textContent = "링크 복사";
+    $("qr-modal").classList.add("on");
+  };
+  $("qr-close").onclick = () => $("qr-modal").classList.remove("on");
+  $("qr-modal").onclick = e => { if (e.target.id === "qr-modal") $("qr-modal").classList.remove("on"); };
+  $("copy").onclick = async () => {
+    try { await navigator.clipboard.writeText($("qr-link").textContent); $("copy").textContent = "복사됨"; }
+    catch { $("copy").textContent = "길게 눌러 복사하세요"; }
+  };
+
+  // ---- QR/링크로 들어온 경우: 닉네임부터 입력 ----
+  const inv = new URLSearchParams(location.search).get("room");
+  const inviteCode = inv && /^[A-HJ-NP-Z2-9]{6}$/i.test(inv) ? inv.toUpperCase() : "";
+  if (inviteCode) {
+    $("code-input").value = inviteCode;
+    $("invite").textContent = "초대받은 방 " + inviteCode + " · 닉네임을 입력하고 입장하세요.";
+    $("make").style.display = "none";
+    $("nick").focus();
+    $("nick").addEventListener("keydown", e => { if (e.key === "Enter") $("join").click(); });
+  }
 </script>
 </body>
 </html>
-
 
