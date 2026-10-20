@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>코드 채팅방</title>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <style>
   :root { --bg:#f3f1ec; --ink:#1d2330; --sub:#6b7280; --main:#2f5d62; --me:#2f5d62; --other:#fff; }
   * { box-sizing:border-box; }
@@ -35,26 +34,6 @@
 </head>
 <body>
 
-<!--
-  준비 (Supabase SQL Editor에서 한 번 실행)
-
-  create table rooms (code text primary key, created_at timestamptz default now());
-  create table messages (
-    id bigint generated always as identity primary key,
-    room_code text references rooms(code),
-    nickname text not null,
-    content text not null check (char_length(content) <= 500),
-    created_at timestamptz default now()
-  );
-  alter table rooms enable row level security;
-  alter table messages enable row level security;
-  create policy "rooms read"   on rooms    for select using (true);
-  create policy "rooms add"    on rooms    for insert with check (true);
-  create policy "msgs read"    on messages for select using (true);
-  create policy "msgs add"     on messages for insert with check (true);
-  alter publication supabase_realtime add table messages;
--->
-
 <section id="home" class="screen on">
   <h1>코드 채팅방</h1>
   <div class="stack">
@@ -77,14 +56,25 @@
   </form>
 </section>
 
-<script>
-  // 1) Supabase 프로젝트 설정 > API 에서 복사해 넣으세요 (anon 키만 사용)
-  const SUPABASE_URL = "여기에_프로젝트_URL";
-  const SUPABASE_ANON_KEY = "여기에_anon_키";
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
+  import { getDatabase, ref, set, get, push, query, orderByKey, limitToLast,
+           onChildAdded, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
 
-  const db = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  const firebaseConfig = {
+    apiKey: "AIzaSyA2GqY6Uk1zqZa5xu85Av8votsECuQVJ3I",
+    authDomain: "chat-e09a9.firebaseapp.com",
+    // Realtime Database 탭 상단의 주소로 바꾸세요 (지역에 따라 다를 수 있음)
+    databaseURL: "https://chat-e09a9-default-rtdb.firebaseio.com",
+    projectId: "chat-e09a9",
+    storageBucket: "chat-e09a9.firebasestorage.app",
+    messagingSenderId: "228650426201",
+    appId: "1:228650426201:web:13fe5991f3dd5a83033648"
+  };
+
+  const db = getDatabase(initializeApp(firebaseConfig));
   const $ = id => document.getElementById(id);
-  let nick = "", code = "", channel = null;
+  let nick = "", code = "", unsubscribe = null;
 
   const show = id => { ["home","room"].forEach(s => $(s).classList.toggle("on", s === id)); };
   const err = t => { $("err").textContent = t || ""; };
@@ -107,30 +97,34 @@
     $("msgs").scrollTop = $("msgs").scrollHeight;
   }
 
-  async function enter(c) {
+  function enter(c) {
     code = c; $("room-code").textContent = c; $("msgs").innerHTML = ""; show("room");
-    const { data } = await db.from("messages").select("*").eq("room_code", c).order("id").limit(100);
-    (data || []).forEach(addMsg);
-    channel = db.channel("room-" + c)
-      .on("postgres_changes", { event:"INSERT", schema:"public", table:"messages", filter:"room_code=eq." + c },
-          p => addMsg(p.new))
-      .subscribe();
+    // 최근 100개를 불러오고, 이후 새 메시지는 자동으로 추가됨
+    const q = query(ref(db, "messages/" + c), orderByKey(), limitToLast(100));
+    unsubscribe = onChildAdded(q, snap => addMsg(snap.val()));
   }
 
   $("make").onclick = async () => {
     if (!getNick()) return;
-    const c = randomCode();
-    const { error } = await db.from("rooms").insert({ code: c });
-    if (error) return err("방을 만들지 못했습니다. 설정을 확인하세요.");
-    err(); enter(c);
+    for (let i = 0; i < 3; i++) {           // 코드가 겹치면 다시 시도
+      const c = randomCode();
+      try {
+        await set(ref(db, "rooms/" + c), { createdAt: serverTimestamp() });
+        err(); return enter(c);
+      } catch (e) { console.error(e); }
+    }
+    err("방을 만들지 못했습니다. 데이터베이스 주소와 규칙을 확인하세요.");
   };
 
   $("join").onclick = async () => {
     if (!getNick()) return;
     const c = $("code-input").value.trim().toUpperCase();
-    const { data } = await db.from("rooms").select("code").eq("code", c).maybeSingle();
-    if (!data) return err("없는 방 코드입니다.");
-    err(); enter(c);
+    if (!/^[A-HJ-NP-Z2-9]{6}$/.test(c)) return err("없는 방 코드입니다.");
+    try {
+      const snap = await get(ref(db, "rooms/" + c));
+      if (!snap.exists()) return err("없는 방 코드입니다.");
+      err(); enter(c);
+    } catch (e) { console.error(e); err("입장하지 못했습니다. 설정을 확인하세요."); }
   };
 
   $("form").onsubmit = async e => {
@@ -138,10 +132,14 @@
     const content = $("text").value.trim();
     if (!content) return;
     $("text").value = "";
-    await db.from("messages").insert({ room_code: code, nickname: nick, content });
+    try {
+      await push(ref(db, "messages/" + code), { nickname: nick, content, createdAt: serverTimestamp() });
+    } catch (e) { console.error(e); }
   };
 
-  $("leave").onclick = () => { if (channel) db.removeChannel(channel); show("home"); };
+  $("leave").onclick = () => { if (unsubscribe) { unsubscribe(); unsubscribe = null; } show("home"); };
 </script>
 </body>
 </html>
+
+
