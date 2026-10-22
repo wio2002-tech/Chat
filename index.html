@@ -48,6 +48,11 @@
   #qr-box svg { width:100%; height:auto; display:block; }
   #qr-link { font-size:12px; color:var(--sub); word-break:break-all; }
   .qr-card button { flex:1; }
+  [hidden] { display:none !important; }
+  button.danger { color:#b42318; border-color:#b42318; }
+  .m .del { background:none; border:0; padding:4px 6px; margin-left:6px; font-size:11px; color:var(--sub); text-decoration:underline; cursor:pointer; border-radius:6px; }
+  .m.me .del { color:#cfe3e0; }
+  @media (max-width:420px) { header span { display:none; } }
 </style>
 </head>
 <body>
@@ -67,7 +72,7 @@
 </section>
 
 <section id="room" class="screen">
-  <header><div><b id="room-code"></b> <span>이 코드를 공유하세요</span></div><div class="hdr-btns"><button id="qr-btn" class="ghost">QR</button><button id="leave" class="ghost">나가기</button></div></header>
+  <header><div><b id="room-code"></b> <span>이 코드를 공유하세요</span></div><div class="hdr-btns"><button id="del-room" class="ghost danger" hidden>방 삭제</button><button id="qr-btn" class="ghost">QR</button><button id="leave" class="ghost">나가기</button></div></header>
   <div id="msgs"></div>
   <div id="typing" aria-live="polite"></div>
   <form id="form" class="row">
@@ -87,8 +92,9 @@
 
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
-  import { getDatabase, ref, set, get, push, query, orderByKey, limitToLast,
-           onChildAdded, onValue, remove, onDisconnect, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
+  import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
+  import { getDatabase, ref, set, get, push, update, query, orderByKey, limitToLast,
+           onChildAdded, onChildRemoved, onValue, remove, onDisconnect, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyA2GqY6Uk1zqZa5xu85Av8votsECuQVJ3I",
@@ -101,11 +107,12 @@
     appId: "1:228650426201:web:13fe5991f3dd5a83033648"
   };
 
-  const db = getDatabase(initializeApp(firebaseConfig));
+  const app = initializeApp(firebaseConfig);
+  const db = getDatabase(app);
+  const auth = getAuth(app);
   const $ = id => document.getElementById(id);
-  let nick = "", code = "", unsubscribe = null;
-  const cid = Math.random().toString(36).slice(2, 10);   // 이 접속의 임시 ID
-  let typingOn = false, typingTimer = null, typingUnsub = null;
+  let uid = "", nick = "", code = "", closing = false, unsubs = [];
+  let typingOn = false, typingTimer = null;
 
   const show = id => { ["home","room"].forEach(s => $(s).classList.toggle("on", s === id)); };
   const err = t => { $("err").textContent = t || ""; };
@@ -119,33 +126,73 @@
     return Array.from({length:6}, () => c[Math.floor(Math.random()*c.length)]).join("");
   };
 
-  function addMsg(m) {
+  // 익명 로그인: 같은 브라우저에서는 같은 uid가 유지됩니다 (내 글/내 방 구분용)
+  const ready = signInAnonymously(auth)
+    .then(c => { uid = c.user.uid; })
+    .catch(e => { console.error(e); err("로그인에 실패했습니다. Firebase에서 익명 로그인을 켰는지 확인하세요."); });
+
+  function addMsg(key, m) {
+    const mine = m.uid === uid;
     const d = document.createElement("div");
-    d.className = "m" + (m.nickname === nick ? " me" : "");
+    d.className = "m" + (mine ? " me" : "");
+    d.dataset.key = key;
     const s = document.createElement("small"); s.textContent = m.nickname;
+    if (mine) {
+      const b = document.createElement("button");
+      b.type = "button"; b.className = "del"; b.textContent = "삭제";
+      b.onclick = () => {
+        if (!confirm("이 메시지를 삭제할까요?")) return;
+        remove(ref(db, "messages/" + code + "/" + key)).catch(e => { console.error(e); alert("삭제하지 못했습니다."); });
+      };
+      s.append(b);
+    }
     d.append(s, document.createTextNode(m.content)); // textContent 방식이라 XSS 안전
     $("msgs").append(d);
     $("msgs").scrollTop = $("msgs").scrollHeight;
   }
 
   function enter(c) {
-    code = c; $("room-code").textContent = c; $("msgs").innerHTML = ""; show("room");
-    // 최근 100개를 불러오고, 이후 새 메시지는 자동으로 추가됨
+    code = c; closing = false;
+    $("room-code").textContent = c; $("msgs").innerHTML = ""; $("typing").textContent = "";
+    $("del-room").hidden = true;
+    show("room");
+    const noop = () => {};
     const q = query(ref(db, "messages/" + c), orderByKey(), limitToLast(100));
-    unsubscribe = onChildAdded(q, snap => addMsg(snap.val()));
-    typingUnsub = onValue(ref(db, "typing/" + c), snap => {
-      const names = [];
-      snap.forEach(ch => { if (ch.key !== cid) names.push(ch.val().nickname); });
-      renderTyping(names);
-    });
+    unsubs = [
+      onChildAdded(q, snap => addMsg(snap.key, snap.val()), noop),
+      onChildRemoved(q, snap => {
+        const el = $("msgs").querySelector('[data-key="' + snap.key + '"]');
+        if (el) el.remove();
+      }, noop),
+      onValue(ref(db, "typing/" + c), snap => {
+        const names = [];
+        snap.forEach(ch => { if (ch.key !== uid) names.push(ch.val().nickname); });
+        renderTyping(names);
+      }, noop),
+      onValue(ref(db, "rooms/" + c), snap => {
+        if (!snap.exists()) {                       // 방이 삭제됨
+          if (!closing) alert("방이 삭제되었습니다.");
+          leaveRoom(); return;
+        }
+        $("del-room").hidden = snap.val().owner !== uid;   // 방장에게만 삭제 버튼 표시
+      }, noop)
+    ];
+  }
+
+  function leaveRoom() {
+    clearTimeout(typingTimer); setTyping(false);
+    unsubs.forEach(u => u()); unsubs = [];
+    $("typing").textContent = ""; $("qr-modal").classList.remove("on");
+    code = ""; show("home");
   }
 
   $("make").onclick = async () => {
     if (!getNick()) return;
+    await ready; if (!uid) return;
     for (let i = 0; i < 3; i++) {           // 코드가 겹치면 다시 시도
       const c = randomCode();
       try {
-        await set(ref(db, "rooms/" + c), { createdAt: serverTimestamp() });
+        await set(ref(db, "rooms/" + c), { createdAt: serverTimestamp(), owner: uid });
         err(); return enter(c);
       } catch (e) { console.error(e); }
     }
@@ -154,6 +201,7 @@
 
   $("join").onclick = async () => {
     if (!getNick()) return;
+    await ready; if (!uid) return;
     const c = $("code-input").value.trim().toUpperCase();
     if (!/^[A-HJ-NP-Z2-9]{6}$/.test(c)) return err("없는 방 코드입니다.");
     try {
@@ -170,22 +218,26 @@
     $("text").value = "";
     clearTimeout(typingTimer); setTyping(false);
     try {
-      await push(ref(db, "messages/" + code), { nickname: nick, content, createdAt: serverTimestamp() });
+      await push(ref(db, "messages/" + code), { nickname: nick, content, uid, createdAt: serverTimestamp() });
     } catch (e) { console.error(e); }
   };
 
-  $("leave").onclick = () => {
-    clearTimeout(typingTimer); setTyping(false);
-    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
-    if (typingUnsub) { typingUnsub(); typingUnsub = null; }
-    $("typing").textContent = "";
-    code = ""; show("home");
+  $("leave").onclick = leaveRoom;
+
+  // ---- 방 삭제 (방장만) ----
+  $("del-room").onclick = async () => {
+    if (!confirm("방을 삭제할까요? 모든 메시지가 함께 지워지고 되돌릴 수 없습니다.")) return;
+    closing = true;
+    const c = code;
+    try {
+      await update(ref(db), { ["rooms/" + c]: null, ["messages/" + c]: null, ["typing/" + c]: null });
+    } catch (e) { closing = false; console.error(e); alert("방을 삭제하지 못했습니다."); }
   };
 
   // ---- 입력 중 표시 ----
   function setTyping(on) {
-    if (!code) return;
-    const r = ref(db, "typing/" + code + "/" + cid);
+    if (!code || !uid) return;
+    const r = ref(db, "typing/" + code + "/" + uid);
     if (on && !typingOn) {
       typingOn = true;
       set(r, { nickname: nick, at: serverTimestamp() }).catch(() => {});
