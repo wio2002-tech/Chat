@@ -52,6 +52,7 @@
   button.danger { color:#b42318; border-color:#b42318; }
   .m .del { background:none; border:0; padding:4px 6px; margin-left:6px; font-size:11px; color:var(--sub); text-decoration:underline; cursor:pointer; border-radius:6px; }
   .m.me .del { color:#cfe3e0; }
+  .m small .t { margin-left:6px; opacity:.85; }
   @media (max-width:420px) { header span { display:none; } }
 </style>
 </head>
@@ -131,12 +132,24 @@
     .then(c => { uid = c.user.uid; })
     .catch(e => { console.error(e); err("로그인에 실패했습니다. Firebase에서 익명 로그인을 켰는지 확인하세요."); });
 
+  function fmtTime(ts) {
+    if (!ts) return "";
+    const d = new Date(ts), now = new Date();
+    const t = d.toLocaleTimeString("ko-KR", { hour: "numeric", minute: "2-digit" });
+    if (d.toDateString() === now.toDateString()) return t;        // 오늘이면 시각만
+    const date = (d.getFullYear() === now.getFullYear() ? "" : d.getFullYear() + "년 ")
+               + (d.getMonth() + 1) + "월 " + d.getDate() + "일";
+    return date + " " + t;
+  }
+
   function addMsg(key, m) {
     const mine = m.uid === uid;
     const d = document.createElement("div");
     d.className = "m" + (mine ? " me" : "");
     d.dataset.key = key;
     const s = document.createElement("small"); s.textContent = m.nickname;
+    const tm = document.createElement("span"); tm.className = "t"; tm.textContent = fmtTime(m.createdAt);
+    s.append(tm);
     if (mine) {
       const b = document.createElement("button");
       b.type = "button"; b.className = "del"; b.textContent = "삭제";
@@ -294,4 +307,3 @@
 </script>
 </body>
 </html>
-
