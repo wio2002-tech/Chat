@@ -53,7 +53,14 @@
   .m .del { background:none; border:0; padding:4px 6px; margin-left:6px; font-size:11px; color:var(--sub); text-decoration:underline; cursor:pointer; border-radius:6px; }
   .m.me .del { color:#cfe3e0; }
   .m small .t { margin-left:6px; opacity:.85; }
-  @media (max-width:420px) { header span { display:none; } }
+  @media (max-width:420px) { header .hint { display:none; } }
+  .cap { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--sub); font-size:14px; }
+  .cap input { width:90px; text-align:center; }
+  .bar { padding:8px 0 0; font-size:13px; color:var(--sub); }
+  .bar select { font:inherit; padding:6px 8px; margin-left:6px; border-radius:8px; border:1px solid #cfcac0; background:#fff; }
+  .m .tr { margin-top:6px; padding-top:6px; border-top:1px dashed currentColor; font-size:14px; opacity:.9; }
+  #toast { position:fixed; left:50%; bottom:90px; transform:translateX(-50%); background:#1d2330; color:#fff; padding:10px 16px; border-radius:999px; font-size:14px; opacity:0; pointer-events:none; transition:opacity .2s; z-index:20; }
+  #toast.on { opacity:1; }
 </style>
 </head>
 <body>
@@ -63,9 +70,10 @@
   <div class="stack">
     <div id="invite"></div>
     <input id="nick" placeholder="닉네임" maxlength="12">
+    <label id="cap-wrap" class="cap">최대 인원<input id="cap" type="number" min="2" max="50" value="10" inputmode="numeric"></label>
     <button id="make">방 만들기</button>
     <div class="row">
-      <input id="code-input" placeholder="방 코드" maxlength="6">
+      <input id="code-input" placeholder="방 코드" maxlength="8">
       <button id="join" class="ghost">입장</button>
     </div>
     <div id="err"></div>
@@ -73,7 +81,14 @@
 </section>
 
 <section id="room" class="screen">
-  <header><div><b id="room-code"></b> <span>이 코드를 공유하세요</span></div><div class="hdr-btns"><button id="del-room" class="ghost danger" hidden>방 삭제</button><button id="qr-btn" class="ghost">QR</button><button id="leave" class="ghost">나가기</button></div></header>
+  <header><div><b id="room-code"></b> <span id="cnt"></span> <span class="hint">이 코드를 공유하세요</span></div><div class="hdr-btns"><button id="del-room" class="ghost danger" hidden>방 삭제</button><button id="qr-btn" class="ghost">QR</button><button id="leave" class="ghost">나가기</button></div></header>
+  <div class="bar"><label>번역 언어
+    <select id="lang">
+      <option value="ko">한국어</option><option value="en">English</option><option value="ja">日本語</option>
+      <option value="zh-CN">中文</option><option value="es">Español</option><option value="fr">Français</option>
+      <option value="de">Deutsch</option><option value="vi">Tiếng Việt</option><option value="th">ภาษาไทย</option>
+      <option value="id">Bahasa Indonesia</option><option value="ru">Русский</option>
+    </select></label></div>
   <div id="msgs"></div>
   <div id="typing" aria-live="polite"></div>
   <form id="form" class="row">
@@ -81,6 +96,8 @@
     <button>보내기</button>
   </form>
 </section>
+
+<div id="toast"></div>
 
 <div id="qr-modal">
   <div class="qr-card">
@@ -113,7 +130,7 @@
   const auth = getAuth(app);
   const $ = id => document.getElementById(id);
   let uid = "", nick = "", code = "", closing = false, unsubs = [];
-  let typingOn = false, typingTimer = null;
+  let typingOn = false, typingTimer = null, memberOD = null, toastTimer = null;
 
   const show = id => { ["home","room"].forEach(s => $(s).classList.toggle("on", s === id)); };
   const err = t => { $("err").textContent = t || ""; };
@@ -122,10 +139,21 @@
     if (!nick) { err("닉네임을 입력하세요."); return false; }
     return true;
   };
+  // 8자리 코드: 추측으로 맞히기 사실상 불가능 (약 1조 가지)
   const randomCode = () => {
     const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    return Array.from({length:6}, () => c[Math.floor(Math.random()*c.length)]).join("");
+    return Array.from({length:8}, () => c[Math.floor(Math.random()*c.length)]).join("");
   };
+  const inviteLink = () => location.origin + location.pathname + "?room=" + code;
+
+  function toast(t) {
+    const el = $("toast"); el.textContent = t; el.classList.add("on");
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove("on"), 2200);
+  }
+  async function copyInvite() {
+    try { await navigator.clipboard.writeText(inviteLink()); toast("초대 링크를 복사했습니다."); }
+    catch { $("qr-btn").click(); }          // 복사가 막히면 QR 창에서 직접 복사
+  }
 
   // 익명 로그인: 같은 브라우저에서는 같은 uid가 유지됩니다 (내 글/내 방 구분용)
   const ready = signInAnonymously(auth)
@@ -136,10 +164,43 @@
     if (!ts) return "";
     const d = new Date(ts), now = new Date();
     const t = d.toLocaleTimeString("ko-KR", { hour: "numeric", minute: "2-digit" });
-    if (d.toDateString() === now.toDateString()) return t;        // 오늘이면 시각만
+    if (d.toDateString() === now.toDateString()) return t;
     const date = (d.getFullYear() === now.getFullYear() ? "" : d.getFullYear() + "년 ")
                + (d.getMonth() + 1) + "월 " + d.getDate() + "일";
     return date + " " + t;
+  }
+
+  // ---- 번역 (번역 버튼을 누른 메시지만 MyMemory 무료 서비스로 전송됩니다) ----
+  function detectLang(t) {
+    if (/[\uAC00-\uD7AF]/.test(t)) return "ko";
+    if (/[\u3040-\u30FF]/.test(t)) return "ja";
+    if (/[\u4E00-\u9FFF]/.test(t)) return "zh-CN";
+    if (/[\u0400-\u04FF]/.test(t)) return "ru";
+    if (/[\u0E00-\u0E7F]/.test(t)) return "th";
+    if (/[\u0600-\u06FF]/.test(t)) return "ar";
+    return "en";
+  }
+  function chunk(text, max = 450) {            // API 길이 제한(약 500바이트) 때문에 나눠서 보냄
+    const enc = new TextEncoder(), out = []; let cur = "";
+    for (const ch of text) {
+      if (enc.encode(cur + ch).length > max) { out.push(cur); cur = ""; }
+      cur += ch;
+    }
+    if (cur) out.push(cur);
+    return out;
+  }
+  const decode = h => { const t = document.createElement("textarea"); t.innerHTML = h; return t.value; };
+  async function translate(text, tgt) {
+    const src = detectLang(text);
+    if (src === tgt) throw new Error("이미 같은 언어입니다.");
+    const parts = [];
+    for (const c of chunk(text)) {
+      const r = await fetch("https://api.mymemory.translated.net/get?q=" + encodeURIComponent(c) + "&langpair=" + src + "|" + tgt);
+      const j = await r.json();
+      if (Number(j.responseStatus) !== 200) throw new Error(Number(j.responseStatus) === 429 ? "오늘 번역 한도를 넘었습니다." : "번역하지 못했습니다.");
+      parts.push(decode(j.responseData.translatedText));
+    }
+    return parts.join(" ");
   }
 
   function addMsg(key, m) {
@@ -150,6 +211,20 @@
     const s = document.createElement("small"); s.textContent = m.nickname;
     const tm = document.createElement("span"); tm.className = "t"; tm.textContent = fmtTime(m.createdAt);
     s.append(tm);
+
+    const tb = document.createElement("button");
+    tb.type = "button"; tb.className = "del"; tb.textContent = "번역";
+    let box = null;
+    tb.onclick = async () => {
+      const lang = $("lang").value;
+      if (box && box.dataset.lang === lang) { box.remove(); box = null; return; }   // 다시 누르면 접기
+      if (!box) { box = document.createElement("div"); box.className = "tr"; d.append(box); }
+      box.dataset.lang = lang; box.textContent = "번역 중…";
+      try { box.textContent = await translate(m.content, lang); }
+      catch (e) { box.textContent = e.message || "번역하지 못했습니다."; }
+    };
+    s.append(tb);
+
     if (mine) {
       const b = document.createElement("button");
       b.type = "button"; b.className = "del"; b.textContent = "삭제";
@@ -166,8 +241,11 @@
 
   function enter(c) {
     code = c; closing = false;
-    $("room-code").textContent = c; $("msgs").innerHTML = ""; $("typing").textContent = "";
+    $("room-code").textContent = c; $("cnt").textContent = "";
+    $("msgs").innerHTML = ""; $("typing").textContent = "";
     $("del-room").hidden = true;
+    memberOD = onDisconnect(ref(db, "rooms/" + c + "/members/" + uid));
+    memberOD.remove().catch(() => {});            // 창을 닫으면 자리가 비워짐
     show("room");
     const noop = () => {};
     const q = query(ref(db, "messages/" + c), orderByKey(), limitToLast(100));
@@ -185,15 +263,22 @@
       onValue(ref(db, "rooms/" + c), snap => {
         if (!snap.exists()) {                       // 방이 삭제됨
           if (!closing) alert("방이 삭제되었습니다.");
-          leaveRoom(); return;
+          leaveRoom(true); return;
         }
-        $("del-room").hidden = snap.val().owner !== uid;   // 방장에게만 삭제 버튼 표시
+        const r = snap.val();
+        $("del-room").hidden = r.owner !== uid;     // 방장에게만 삭제 버튼 표시
+        $("cnt").textContent = Object.keys(r.members || {}).length + "/" + r.max + "명";
       }, noop)
     ];
   }
 
-  function leaveRoom() {
+  function leaveRoom(roomGone = false) {
     clearTimeout(typingTimer); setTyping(false);
+    if (!roomGone && code) {
+      if (memberOD) memberOD.cancel().catch(() => {});
+      remove(ref(db, "rooms/" + code + "/members/" + uid)).catch(() => {});
+    }
+    memberOD = null;
     unsubs.forEach(u => u()); unsubs = [];
     $("typing").textContent = ""; $("qr-modal").classList.remove("on");
     code = ""; show("home");
@@ -202,11 +287,13 @@
   $("make").onclick = async () => {
     if (!getNick()) return;
     await ready; if (!uid) return;
+    const max = Math.min(50, Math.max(2, parseInt($("cap").value, 10) || 10));
+    $("cap").value = max;
     for (let i = 0; i < 3; i++) {           // 코드가 겹치면 다시 시도
       const c = randomCode();
       try {
-        await set(ref(db, "rooms/" + c), { createdAt: serverTimestamp(), owner: uid });
-        err(); return enter(c);
+        await set(ref(db, "rooms/" + c), { createdAt: serverTimestamp(), owner: uid, max, members: { [uid]: true } });
+        err(); enter(c); copyInvite(); return;
       } catch (e) { console.error(e); }
     }
     err("방을 만들지 못했습니다. 데이터베이스 주소와 규칙을 확인하세요.");
@@ -216,12 +303,16 @@
     if (!getNick()) return;
     await ready; if (!uid) return;
     const c = $("code-input").value.trim().toUpperCase();
-    if (!/^[A-HJ-NP-Z2-9]{6}$/.test(c)) return err("없는 방 코드입니다.");
+    if (!/^[A-HJ-NP-Z2-9]{6,8}$/.test(c)) return err("없는 방 코드입니다.");
     try {
       const snap = await get(ref(db, "rooms/" + c));
       if (!snap.exists()) return err("없는 방 코드입니다.");
+      const r = snap.val(), members = r.members || {}, n = Object.keys(members).length;
+      if (!r.max) return err("이전 버전으로 만든 방입니다. 새로 만들어 주세요.");
+      if (!members[uid] && n >= r.max) return err("방이 가득 찼습니다. (" + n + "/" + r.max + "명)");
+      await set(ref(db, "rooms/" + c + "/members/" + uid), true);
       err(); enter(c);
-    } catch (e) { console.error(e); err("입장하지 못했습니다. 설정을 확인하세요."); }
+    } catch (e) { console.error(e); err("입장하지 못했습니다. 방이 가득 찼거나 설정을 확인하세요."); }
   };
 
   $("form").onsubmit = async e => {
@@ -235,7 +326,7 @@
     } catch (e) { console.error(e); }
   };
 
-  $("leave").onclick = leaveRoom;
+  $("leave").onclick = () => leaveRoom();
 
   // ---- 방 삭제 (방장만) ----
   $("del-room").onclick = async () => {
@@ -280,7 +371,7 @@
 
   // ---- QR 초대 ----
   $("qr-btn").onclick = () => {
-    const link = location.origin + location.pathname + "?room=" + code;
+    const link = inviteLink();
     const qr = qrcode(0, "M"); qr.addData(link); qr.make();
     $("qr-box").innerHTML = qr.createSvgTag({ scalable: true, margin: 2 });
     $("qr-link").textContent = link;
@@ -294,13 +385,18 @@
     catch { $("copy").textContent = "길게 눌러 복사하세요"; }
   };
 
+  // ---- 번역 언어 기억 ----
+  try { const l = localStorage.getItem("lang"); if (l) $("lang").value = l; } catch {}
+  $("lang").onchange = () => { try { localStorage.setItem("lang", $("lang").value); } catch {} };
+
   // ---- QR/링크로 들어온 경우: 닉네임부터 입력 ----
   const inv = new URLSearchParams(location.search).get("room");
-  const inviteCode = inv && /^[A-HJ-NP-Z2-9]{6}$/i.test(inv) ? inv.toUpperCase() : "";
+  const inviteCode = inv && /^[A-HJ-NP-Z2-9]{6,8}$/i.test(inv) ? inv.toUpperCase() : "";
   if (inviteCode) {
     $("code-input").value = inviteCode;
     $("invite").textContent = "초대받은 방 " + inviteCode + " · 닉네임을 입력하고 입장하세요.";
     $("make").style.display = "none";
+    $("cap-wrap").style.display = "none";
     $("nick").focus();
     $("nick").addEventListener("keydown", e => { if (e.key === "Enter") $("join").click(); });
   }
