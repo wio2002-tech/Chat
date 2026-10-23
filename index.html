@@ -55,12 +55,21 @@
   .m small .t { margin-left:6px; opacity:.85; }
   @media (max-width:420px) { header .hint { display:none; } }
   .cap { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--sub); font-size:14px; }
-  .cap input { width:90px; text-align:center; }
+  .cap select { font:inherit; padding:8px 10px; border-radius:10px; border:1px solid #cfcac0; background:#fff; }
   .bar { padding:8px 0 0; font-size:13px; color:var(--sub); }
   .bar select { font:inherit; padding:6px 8px; margin-left:6px; border-radius:8px; border:1px solid #cfcac0; background:#fff; }
   .m .tr { margin-top:6px; padding-top:6px; border-top:1px dashed currentColor; font-size:14px; opacity:.9; }
   #toast { position:fixed; left:50%; bottom:90px; transform:translateX(-50%); background:#1d2330; color:#fff; padding:10px 16px; border-radius:999px; font-size:14px; opacity:0; pointer-events:none; transition:opacity .2s; z-index:20; }
   #toast.on { opacity:1; }
+  .m a { text-decoration:underline; word-break:break-all; }
+  .m:not(.me) a { color:var(--main); }
+  .m.me a { color:#fff; }
+  #link-modal { position:fixed; inset:0; background:rgba(0,0,0,.5); display:none; align-items:center; justify-content:center; padding:16px; z-index:10; }
+  #link-modal.on { display:flex; }
+  .link-url { background:#f3f1ec; border-radius:10px; padding:10px 12px; font-size:13px; word-break:break-all; max-height:30vh; overflow:auto; }
+  .trust { display:flex; align-items:center; font-size:14px; gap:8px; }
+  .trust input { width:auto; padding:0; margin:0; }
+  #link-modal .qr-card { text-align:left; }
 </style>
 </head>
 <body>
@@ -70,7 +79,7 @@
   <div class="stack">
     <div id="invite"></div>
     <input id="nick" placeholder="닉네임" maxlength="12">
-    <label id="cap-wrap" class="cap">최대 인원<input id="cap" type="number" min="2" max="50" value="10" inputmode="numeric"></label>
+    <label id="cap-wrap" class="cap">최대 인원<select id="cap"><option value="2">2명</option><option value="5">5명</option><option value="10" selected>10명</option><option value="20">20명</option><option value="50">50명</option></select></label>
     <button id="make">방 만들기</button>
     <div class="row">
       <input id="code-input" placeholder="방 코드" maxlength="8">
@@ -96,6 +105,15 @@
     <button>보내기</button>
   </form>
 </section>
+
+<div id="link-modal">
+  <div class="qr-card">
+    <b>이 링크를 열까요?</b>
+    <div id="link-url" class="link-url"></div>
+    <label class="trust"><input type="checkbox" id="link-trust"><span>이 사이트(<b id="link-host"></b>)를 신뢰합니다</span></label>
+    <div class="row"><button id="link-cancel" class="ghost">취소</button><button id="link-open">열기</button></div>
+  </div>
+</div>
 
 <div id="toast"></div>
 
@@ -130,7 +148,7 @@
   const auth = getAuth(app);
   const $ = id => document.getElementById(id);
   let uid = "", nick = "", code = "", closing = false, unsubs = [];
-  let typingOn = false, typingTimer = null, memberOD = null, toastTimer = null;
+  let typingOn = false, typingTimer = null, memberOD = null, mySlot = "", toastTimer = null;
 
   const show = id => { ["home","room"].forEach(s => $(s).classList.toggle("on", s === id)); };
   const err = t => { $("err").textContent = t || ""; };
@@ -234,18 +252,19 @@
       };
       s.append(b);
     }
-    d.append(s, document.createTextNode(m.content)); // textContent 방식이라 XSS 안전
+    d.append(s, renderContent(m.content)); // DOM 방식이라 XSS 안전
     $("msgs").append(d);
     $("msgs").scrollTop = $("msgs").scrollHeight;
   }
 
-  function enter(c) {
+  function enter(c, slot) {
     code = c; closing = false;
     $("room-code").textContent = c; $("cnt").textContent = "";
     $("msgs").innerHTML = ""; $("typing").textContent = "";
     $("del-room").hidden = true;
-    memberOD = onDisconnect(ref(db, "rooms/" + c + "/members/" + uid));
-    memberOD.remove().catch(() => {});            // 창을 닫으면 자리가 비워짐
+    mySlot = slot;
+    memberOD = onDisconnect(ref(db, "rooms/" + c));
+    memberOD.update({ ["members/" + uid]: null, ["seats/" + slot]: null }).catch(() => {});   // 창을 닫으면 자리가 비워짐
     show("room");
     const noop = () => {};
     const q = query(ref(db, "messages/" + c), orderByKey(), limitToLast(100));
@@ -267,7 +286,7 @@
         }
         const r = snap.val();
         $("del-room").hidden = r.owner !== uid;     // 방장에게만 삭제 버튼 표시
-        $("cnt").textContent = Object.keys(r.members || {}).length + "/" + r.max + "명";
+        $("cnt").textContent = Object.keys(r.seats || {}).length + "/" + r.max + "명";
       }, noop)
     ];
   }
@@ -276,7 +295,7 @@
     clearTimeout(typingTimer); setTyping(false);
     if (!roomGone && code) {
       if (memberOD) memberOD.cancel().catch(() => {});
-      remove(ref(db, "rooms/" + code + "/members/" + uid)).catch(() => {});
+      update(ref(db), { ["rooms/" + code + "/members/" + uid]: null, ["rooms/" + code + "/seats/" + mySlot]: null }).catch(() => {});
     }
     memberOD = null;
     unsubs.forEach(u => u()); unsubs = [];
@@ -287,13 +306,12 @@
   $("make").onclick = async () => {
     if (!getNick()) return;
     await ready; if (!uid) return;
-    const max = Math.min(50, Math.max(2, parseInt($("cap").value, 10) || 10));
-    $("cap").value = max;
+    const max = parseInt($("cap").value, 10);
     for (let i = 0; i < 3; i++) {           // 코드가 겹치면 다시 시도
       const c = randomCode();
       try {
-        await set(ref(db, "rooms/" + c), { createdAt: serverTimestamp(), owner: uid, max, members: { [uid]: true } });
-        err(); enter(c); copyInvite(); return;
+        await set(ref(db, "rooms/" + c), { createdAt: serverTimestamp(), owner: uid, max, seats: { s0: uid }, members: { [uid]: "s0" } });
+        err(); enter(c, "s0"); copyInvite(); return;
       } catch (e) { console.error(e); }
     }
     err("방을 만들지 못했습니다. 데이터베이스 주소와 규칙을 확인하세요.");
@@ -307,11 +325,19 @@
     try {
       const snap = await get(ref(db, "rooms/" + c));
       if (!snap.exists()) return err("없는 방 코드입니다.");
-      const r = snap.val(), members = r.members || {}, n = Object.keys(members).length;
+      const r = snap.val(), seats = r.seats || {};
       if (!r.max) return err("이전 버전으로 만든 방입니다. 새로 만들어 주세요.");
-      if (!members[uid] && n >= r.max) return err("방이 가득 찼습니다. (" + n + "/" + r.max + "명)");
-      await set(ref(db, "rooms/" + c + "/members/" + uid), true);
-      err(); enter(c);
+      let slot = Object.keys(seats).find(k => seats[k] === uid) || "";   // 이미 내 자리가 있으면 재사용
+      for (let i = 0; !slot && i < r.max; i++) {
+        const k = "s" + i;
+        if (seats[k]) continue;
+        try { await set(ref(db, "rooms/" + c + "/seats/" + k), uid); slot = k; }
+        catch (e) { /* 동시에 다른 사람이 앉음 → 다음 자리 */ }
+      }
+      if (!slot) return err("방이 가득 찼습니다. (" + Object.keys(seats).length + "/" + r.max + "명)");
+      try { await set(ref(db, "rooms/" + c + "/members/" + uid), slot); }
+      catch (e) { remove(ref(db, "rooms/" + c + "/seats/" + slot)).catch(() => {}); throw e; }
+      err(); enter(c, slot);
     } catch (e) { console.error(e); err("입장하지 못했습니다. 방이 가득 찼거나 설정을 확인하세요."); }
   };
 
@@ -385,6 +411,48 @@
     catch { $("copy").textContent = "길게 눌러 복사하세요"; }
   };
 
+  // ---- 링크: 눌렀을 때 확인 창 ----
+  const getTrusted = () => { try { return JSON.parse(localStorage.getItem("trusted") || "[]"); } catch { return []; } };
+  const addTrusted = h => { try { const t = getTrusted(); if (!t.includes(h)) { t.push(h); localStorage.setItem("trusted", JSON.stringify(t)); } } catch {} };
+  let pendingUrl = null;
+  const closeLink = () => { $("link-modal").classList.remove("on"); pendingUrl = null; };
+  const openLink = url => window.open(url, "_blank", "noopener,noreferrer");
+
+  function askOpen(url) {
+    let u; try { u = new URL(url); } catch { return; }
+    if (!/^https?:$/.test(u.protocol)) return;
+    if (getTrusted().includes(u.hostname)) return openLink(u.href);   // 신뢰한 사이트는 바로 열기
+    pendingUrl = u;
+    $("link-url").textContent = u.href;
+    $("link-host").textContent = u.hostname;
+    $("link-trust").checked = false;
+    $("link-modal").classList.add("on");
+  }
+  $("link-cancel").onclick = closeLink;
+  $("link-modal").onclick = e => { if (e.target.id === "link-modal") closeLink(); };
+  $("link-open").onclick = () => {
+    if (!pendingUrl) return;
+    if ($("link-trust").checked) addTrusted(pendingUrl.hostname);
+    openLink(pendingUrl.href);
+    closeLink();
+  };
+
+  function renderContent(text) {
+    const frag = document.createDocumentFragment();
+    text.split(/(https?:\/\/[^\s<>"']+)/gi).forEach((part, i) => {
+      if (i % 2 === 0) { if (part) frag.append(part); return; }       // 짝수: 일반 글, 홀수: 링크
+      const m = part.match(/^(.*?)([.,!?;:)\]}]*)$/);
+      const url = m[1], tail = m[2];
+      let ok = false; try { ok = /^https?:$/.test(new URL(url).protocol); } catch {}
+      if (!ok) { frag.append(part); return; }
+      const a = document.createElement("a");
+      a.href = url; a.textContent = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      a.onclick = e => { e.preventDefault(); askOpen(url); };
+      frag.append(a, tail);
+    });
+    return frag;
+  }
+
   // ---- 번역 언어 기억 ----
   try { const l = localStorage.getItem("lang"); if (l) $("lang").value = l; } catch {}
   $("lang").onchange = () => { try { localStorage.setItem("lang", $("lang").value); } catch {} };
@@ -403,3 +471,4 @@
 </script>
 </body>
 </html>
+
