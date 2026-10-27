@@ -148,7 +148,7 @@
   const auth = getAuth(app);
   const $ = id => document.getElementById(id);
   let uid = "", nick = "", code = "", closing = false, unsubs = [];
-  let typingOn = false, typingTimer = null, memberOD = null, mySlot = "", toastTimer = null;
+  let typingOn = false, typingTimer = null, memberOD = null, mySlot = "", toastTimer = null, lastCode = "";
 
   const show = id => { ["home","room"].forEach(s => $(s).classList.toggle("on", s === id)); };
   const err = t => { $("err").textContent = t || ""; };
@@ -164,9 +164,9 @@
   };
   const inviteLink = () => location.origin + location.pathname + "?room=" + code;
 
-  function toast(t) {
+  function toast(t, ms = 2200) {
     const el = $("toast"); el.textContent = t; el.classList.add("on");
-    clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove("on"), 2200);
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove("on"), ms);
   }
   async function copyInvite() {
     try { await navigator.clipboard.writeText(inviteLink()); toast("초대 링크를 복사했습니다."); }
@@ -263,10 +263,12 @@
     $("msgs").innerHTML = ""; $("typing").textContent = "";
     $("del-room").hidden = true;
     mySlot = slot;
-    memberOD = onDisconnect(ref(db, "rooms/" + c));
-    memberOD.update({ ["members/" + uid + "/" + slot]: null, ["seats/" + slot]: null }).catch(() => {});   // 창을 닫으면 자리가 비워짐
+    registerDisconnect();   // 창을 닫으면 자리가 비워짐
     show("room");
-    const noop = () => {};
+    const noop = e => {
+      if (!e || !code || closing) return;
+      console.error(e); toast("읽기 오류 (" + (e.code || e.message) + ")", 6000);
+    };
     const q = query(ref(db, "messages/" + c), orderByKey(), limitToLast(100));
     unsubs = [
       onChildAdded(q, snap => addMsg(snap.key, snap.val()), noop),
@@ -287,6 +289,7 @@
         const r = snap.val();
         $("del-room").hidden = r.owner !== uid;     // 방장에게만 삭제 버튼 표시
         $("cnt").textContent = Object.keys(r.seats || {}).length + "/" + r.max + "명";
+        ensurePresence(r);
       }, noop)
     ];
   }
@@ -297,7 +300,7 @@
       if (memberOD) memberOD.cancel().catch(() => {});
       update(ref(db), { ["rooms/" + code + "/members/" + uid + "/" + mySlot]: null, ["rooms/" + code + "/seats/" + mySlot]: null }).catch(() => {});
     }
-    memberOD = null;
+    memberOD = null; mySlot = "";
     unsubs.forEach(u => u()); unsubs = [];
     $("typing").textContent = ""; $("qr-modal").classList.remove("on");
     code = ""; show("home");
@@ -313,9 +316,9 @@
       try {
         await set(ref(db, "rooms/" + c), { createdAt: serverTimestamp(), owner: uid, max, seats: { a: uid }, members: { [uid]: { a: true } } });
         err(); enter(c, "a"); copyInvite(); return;
-      } catch (e) { console.error(e); }
+      } catch (e) { console.error(e); lastCode = e.code || e.message; }
     }
-    err("방을 만들지 못했습니다. 데이터베이스 주소와 규칙을 확인하세요.");
+    err("방을 만들지 못했습니다. 규칙/설정을 확인하세요. (" + lastCode + ")");
   };
 
   $("join").onclick = async () => {
@@ -339,7 +342,7 @@
       try { await set(ref(db, "rooms/" + c + "/members/" + uid + "/" + slot), true); }
       catch (e) { remove(ref(db, "rooms/" + c + "/seats/" + slot)).catch(() => {}); throw e; }
       err(); enter(c, slot);
-    } catch (e) { console.error(e); err("입장하지 못했습니다. 방이 가득 찼거나 설정을 확인하세요."); }
+    } catch (e) { console.error(e); err("입장하지 못했습니다. (" + (e.code || e.message) + ")"); }
   };
 
   $("form").onsubmit = async e => {
@@ -350,7 +353,7 @@
     clearTimeout(typingTimer); setTyping(false);
     try {
       await push(ref(db, "messages/" + code), { nickname: nick, content, uid, createdAt: serverTimestamp() });
-    } catch (e) { console.error(e); }
+    } catch (e) { console.error(e); toast("메시지를 보내지 못했습니다 (" + (e.code || e.message) + ")", 6000); }
   };
 
   $("leave").onclick = () => leaveRoom();
@@ -412,6 +415,38 @@
     catch { $("copy").textContent = "길게 눌러 복사하세요"; }
   };
 
+  // ---- 접속 유지: 연결이 끊겼다 돌아오면 자리를 다시 잡음 ----
+  let healing = false;
+  function registerDisconnect() {
+    if (!code || !mySlot) return;
+    memberOD = onDisconnect(ref(db, "rooms/" + code));
+    memberOD.update({ ["members/" + uid + "/" + mySlot]: null, ["seats/" + mySlot]: null })
+      .catch(e => console.error("onDisconnect", e));
+  }
+  // 연결될 때마다 (재연결 포함) 접속 해제 예약을 다시 걸어 둠
+  onValue(ref(db, ".info/connected"), snap => { if (snap.val() === true) registerDisconnect(); });
+
+  async function ensurePresence(r) {
+    if (healing || !code || closing || !mySlot) return;
+    const seats = r.seats || {}, mine = (r.members || {})[uid] || {};
+    if (seats[mySlot] === uid && mine[mySlot] === true) return;       // 정상
+    healing = true;
+    try {
+      let slot = seats[mySlot] === uid ? mySlot : "";
+      for (let i = 0; !slot && i < r.max; i++) {
+        const k = "a".repeat(i + 1);
+        if (seats[k]) continue;
+        try { await set(ref(db, "rooms/" + code + "/seats/" + k), uid); slot = k; } catch (e) {}
+      }
+      if (!slot) { alert("연결이 끊긴 사이 자리가 모두 찼습니다."); leaveRoom(true); return; }
+      await set(ref(db, "rooms/" + code + "/members/" + uid + "/" + slot), true);
+      mySlot = slot;
+      registerDisconnect();
+    } catch (e) {
+      console.error(e); toast("연결을 복구하지 못했습니다 (" + (e.code || e.message) + ")", 6000);
+    } finally { healing = false; }
+  }
+
   // ---- 링크: 눌렀을 때 확인 창 ----
   const getTrusted = () => { try { return JSON.parse(localStorage.getItem("trusted") || "[]"); } catch { return []; } };
   const addTrusted = h => { try { const t = getTrusted(); if (!t.includes(h)) { t.push(h); localStorage.setItem("trusted", JSON.stringify(t)); } } catch {} };
@@ -472,4 +507,5 @@
 </script>
 </body>
 </html>
+
 
