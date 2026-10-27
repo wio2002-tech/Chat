@@ -55,7 +55,7 @@
   .m small .t { margin-left:6px; opacity:.85; }
   @media (max-width:420px) { header .hint { display:none; } }
   .cap { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--sub); font-size:14px; }
-  .cap select { font:inherit; padding:8px 10px; border-radius:10px; border:1px solid #cfcac0; background:#fff; }
+  .cap input { width:90px; text-align:center; }
   .bar { padding:8px 0 0; font-size:13px; color:var(--sub); }
   .bar select { font:inherit; padding:6px 8px; margin-left:6px; border-radius:8px; border:1px solid #cfcac0; background:#fff; }
   .m .tr { margin-top:6px; padding-top:6px; border-top:1px dashed currentColor; font-size:14px; opacity:.9; }
@@ -79,7 +79,7 @@
   <div class="stack">
     <div id="invite"></div>
     <input id="nick" placeholder="닉네임" maxlength="12">
-    <label id="cap-wrap" class="cap">최대 인원<select id="cap"><option value="2">2명</option><option value="5">5명</option><option value="10" selected>10명</option><option value="20">20명</option><option value="50">50명</option></select></label>
+    <label id="cap-wrap" class="cap">최대 인원<input id="cap" type="number" min="2" max="50" value="2" inputmode="numeric"></label>
     <button id="make">방 만들기</button>
     <div class="row">
       <input id="code-input" placeholder="방 코드" maxlength="8">
@@ -264,7 +264,7 @@
     $("del-room").hidden = true;
     mySlot = slot;
     memberOD = onDisconnect(ref(db, "rooms/" + c));
-    memberOD.update({ ["members/" + uid]: null, ["seats/" + slot]: null }).catch(() => {});   // 창을 닫으면 자리가 비워짐
+    memberOD.update({ ["members/" + uid + "/" + slot]: null, ["seats/" + slot]: null }).catch(() => {});   // 창을 닫으면 자리가 비워짐
     show("room");
     const noop = () => {};
     const q = query(ref(db, "messages/" + c), orderByKey(), limitToLast(100));
@@ -295,7 +295,7 @@
     clearTimeout(typingTimer); setTyping(false);
     if (!roomGone && code) {
       if (memberOD) memberOD.cancel().catch(() => {});
-      update(ref(db), { ["rooms/" + code + "/members/" + uid]: null, ["rooms/" + code + "/seats/" + mySlot]: null }).catch(() => {});
+      update(ref(db), { ["rooms/" + code + "/members/" + uid + "/" + mySlot]: null, ["rooms/" + code + "/seats/" + mySlot]: null }).catch(() => {});
     }
     memberOD = null;
     unsubs.forEach(u => u()); unsubs = [];
@@ -307,11 +307,12 @@
     if (!getNick()) return;
     await ready; if (!uid) return;
     const max = parseInt($("cap").value, 10);
+    if (!(max >= 2 && max <= 50)) return err("인원은 2~50명 사이로 입력하세요.");
     for (let i = 0; i < 3; i++) {           // 코드가 겹치면 다시 시도
       const c = randomCode();
       try {
-        await set(ref(db, "rooms/" + c), { createdAt: serverTimestamp(), owner: uid, max, seats: { s0: uid }, members: { [uid]: "s0" } });
-        err(); enter(c, "s0"); copyInvite(); return;
+        await set(ref(db, "rooms/" + c), { createdAt: serverTimestamp(), owner: uid, max, seats: { a: uid }, members: { [uid]: { a: true } } });
+        err(); enter(c, "a"); copyInvite(); return;
       } catch (e) { console.error(e); }
     }
     err("방을 만들지 못했습니다. 데이터베이스 주소와 규칙을 확인하세요.");
@@ -327,15 +328,15 @@
       if (!snap.exists()) return err("없는 방 코드입니다.");
       const r = snap.val(), seats = r.seats || {};
       if (!r.max) return err("이전 버전으로 만든 방입니다. 새로 만들어 주세요.");
-      let slot = Object.keys(seats).find(k => seats[k] === uid) || "";   // 이미 내 자리가 있으면 재사용
+      let slot = "";   // 접속(탭)마다 자리를 하나씩 차지
       for (let i = 0; !slot && i < r.max; i++) {
-        const k = "s" + i;
+        const k = "a".repeat(i + 1);
         if (seats[k]) continue;
         try { await set(ref(db, "rooms/" + c + "/seats/" + k), uid); slot = k; }
         catch (e) { /* 동시에 다른 사람이 앉음 → 다음 자리 */ }
       }
       if (!slot) return err("방이 가득 찼습니다. (" + Object.keys(seats).length + "/" + r.max + "명)");
-      try { await set(ref(db, "rooms/" + c + "/members/" + uid), slot); }
+      try { await set(ref(db, "rooms/" + c + "/members/" + uid + "/" + slot), true); }
       catch (e) { remove(ref(db, "rooms/" + c + "/seats/" + slot)).catch(() => {}); throw e; }
       err(); enter(c, slot);
     } catch (e) { console.error(e); err("입장하지 못했습니다. 방이 가득 찼거나 설정을 확인하세요."); }
